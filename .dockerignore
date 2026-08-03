@@ -1,0 +1,7 @@
+.venv
+__pycache__
+*.pyc
+screenshots
+task_plan.json
+raw_tasks.json
+.claude

@@ -1,0 +1,16 @@
+.venv/
+__pycache__/
+*.pyc
+
+# 运行时产物，含真实账号任务数据，不进版本库
+raw_tasks.json
+task_plan.json
+screenshots/*
+!screenshots/.gitkeep
+
+# 本地工具配置/锁文件
+.claude/
+
+# Docker 镜像导出文件，体积太大不进版本库
+*.tar
+reset_hours_result.json
