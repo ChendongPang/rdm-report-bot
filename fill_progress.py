@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
 """
 自动为"计划开始日期是上个月"的任务，按 估计工作量(小时)/8 算出的天数，
-从上个月第一个工作日开始连续排期，逐日填写进展（完成率91，当日投入工作量8，
-描述由大模型生成且互不相同），并提交保存。
+从上个月第一个工作日开始连续排期，逐日填写进展（完成率从 RATE_START 逐天
+递增到该任务最后一天落在 (RATE_END_MIN, RATE_END_MAX) 之间的随机值，当日
+投入工作量固定 8 小时，描述由大模型生成且互不相同），并提交保存。
 
 流程:
   1. 登录
   2. 读取"我的任务"列表，筛选 计划开始日期 在上个月的任务
   3. 计算每个任务需要的工作日天数 = ceil(估计工作量/8)，任务之间日期连续排（不跳回月初），
-     执行日期落在上个月内（自然不会超过今天）
+     执行日期落在上个月内（自然不会超过今天），同时给每个任务生成一条递增的完成率序列
   4. 把整体计划存成 JSON（task_plan.json），打印出来供确认
-  5. 确认后逐条填写: 执行日期 / 完成率(91) / 当日投入工作量(8) / 描述(大模型生成) -> 点击"确定"
+  5. 确认后逐条填写: 执行日期 / 完成率(递增) / 当日投入工作量(8) / 描述(大模型生成) -> 点击"确定"
 """
 
 import calendar
@@ -19,6 +20,7 @@ import getpass
 import json
 import math
 import os
+import random
 import re
 import time
 
@@ -29,8 +31,14 @@ from llm_helper import generate_daily_descriptions
 URL = "https://imm.kmerit.com:64892/index.jsp"
 PLAN_FILE = "task_plan.json"
 
-REPORT_RATE = "91"
 REPORT_HOURS = "8"
+
+# 完成率不再是固定值：每个任务从 RATE_START 开始，随着天数往上涨，涨到
+# 这个任务最后一天时落在 (RATE_END_MIN, RATE_END_MAX) 之间的一个随机值
+# （每个任务的终值不一样，看起来更像真实进度，而不是每天都写死同一个数）。
+RATE_START = 5
+RATE_END_MIN = 92
+RATE_END_MAX = 96
 
 # 安全阀：先设小一点跑通流程，确认没问题后再调大。MAX_ENTRIES=0 表示不限制，把计划里的都填完。
 _max_entries_raw = int(os.getenv("MAX_ENTRIES", "1"))
@@ -149,6 +157,18 @@ def parse_tasks(task_frame) -> list[dict]:
     return tasks
 
 
+def build_rate_sequence(n: int) -> list[int]:
+    """给一个任务的 n 天生成递增的完成率序列：从 RATE_START 开始，随天数逐步
+    涨到最后一天落在 (RATE_END_MIN, RATE_END_MAX) 之间的一个随机值（每个任务
+    的终值不同，更像真实进度而不是每天都写死同一个数）。"""
+    if n <= 0:
+        return []
+    end = random.randint(RATE_END_MIN, RATE_END_MAX)
+    if n == 1:
+        return [end]
+    return [round(RATE_START + (end - RATE_START) * i / (n - 1)) for i in range(n)]
+
+
 def build_plan(tasks: list[dict], today: datetime.date) -> list[dict]:
     target_year, target_month = previous_month(today)
 
@@ -177,6 +197,7 @@ def build_plan(tasks: list[dict], today: datetime.date) -> list[dict]:
                 "days_needed": days_needed,
                 "assigned_dates": [d.isoformat() for d in assigned],
                 "pending_days": days_needed - len(assigned),
+                "rates": build_rate_sequence(len(assigned)),
             }
         )
     return plan
@@ -191,6 +212,8 @@ def print_plan(plan: list[dict]):
         print(f"- {p['name']}  估计工作量: {p['plan_effort_hours']}小时  需要 {p['days_needed']} 天")
         if p["assigned_dates"]:
             print(f"    分配日期: {', '.join(p['assigned_dates'])}")
+        if p["rates"]:
+            print(f"    完成率: {p['rates'][0]}% -> {p['rates'][-1]}%")
         if p["pending_days"] > 0:
             print(f"    ⚠ 上个月工作日不够分了，还有 {p['pending_days']} 天没排上，本次不会填写")
     print("=============================\n")
@@ -320,7 +343,7 @@ def select_calendar_date(entity_frame, date_str: str):
     page.wait_for_timeout(400)
 
 
-def fill_and_submit(entity_frame, tab_frame, date_str: str, description: str):
+def fill_and_submit(entity_frame, tab_frame, date_str: str, description: str, rate: int):
     # 先真实点日历选中目标日期（会触发控件自己的 dataChange，如果这天已有记录，
     # 通常这时完成率/描述就会被加载成旧值），再等一下给可能的异步加载留时间，
     # 然后把完成率/工时/描述覆盖成我们要的新值。
@@ -343,7 +366,7 @@ def fill_and_submit(entity_frame, tab_frame, date_str: str, description: str):
                 try { dataChange(); } catch (e) {}
             }
         }""",
-        [REPORT_RATE, REPORT_HOURS, description],
+        [str(rate), REPORT_HOURS, description],
     )
     entity_frame.page.wait_for_timeout(200)
 
@@ -458,12 +481,13 @@ def main():
             p["descriptions"] = descriptions
             log("描述生成完成")
 
-            for date_str, desc in zip(p["assigned_dates"], descriptions):
+            for date_str, desc, rate in zip(p["assigned_dates"], descriptions, p["rates"]):
                 if submitted >= MAX_ENTRIES_TO_SUBMIT:
                     break
 
                 idx = submitted + 1
                 print(f"\n>>> [{idx}/{run_total}] 填写任务《{p['name']}》 日期 {date_str}")
+                print(f"    完成率: {rate}%")
                 print(f"    描述: {desc}")
 
                 # 批量跑（尤其是 MAX_ENTRIES=0 不限制）的时候，某一条偶发超时/卡顿
@@ -478,7 +502,7 @@ def main():
 
                         log(f"选择执行日期 {date_str}...")
                         log("填写完成率/工时/描述并提交...")
-                        fill_and_submit(entity_frame, tab_frame, date_str, desc)
+                        fill_and_submit(entity_frame, tab_frame, date_str, desc, rate)
                         log("提交完成")
 
                         page.wait_for_timeout(1500)
