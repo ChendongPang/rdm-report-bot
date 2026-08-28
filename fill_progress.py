@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """
-自动为"计划开始日期是上个月"的任务，按 估计工作量(小时)/8 算出的天数，
-从上个月第一个工作日开始连续排期，逐日填写进展（完成率从 RATE_START 逐天
+自动为"计划开始日期是指定月份"的任务，按 估计工作量(小时)/8 算出的天数，
+从指定月份第一个工作日开始连续排期，逐日填写进展（完成率从 RATE_START 逐天
 递增到该任务最后一天落在 (RATE_END_MIN, RATE_END_MAX) 之间的随机值，当日
 投入工作量固定 8 小时，描述由大模型生成且互不相同），并提交保存。
 
 流程:
   1. 登录
-  2. 读取"我的任务"列表，筛选 计划开始日期 在上个月的任务
+  2. 输入要填报的月份，读取"我的任务"列表并筛选该月份的任务
   3. 计算每个任务需要的工作日天数 = ceil(估计工作量/8)，任务之间日期连续排（不跳回月初），
-     执行日期落在上个月内（自然不会超过今天），同时给每个任务生成一条递增的完成率序列
+     执行日期落在指定月份内（不会超过今天），同时给每个任务生成一条递增的完成率序列
   4. 把整体计划存成 JSON（task_plan.json），打印出来供确认
   5. 确认后逐条填写: 执行日期 / 完成率(递增) / 当日投入工作量(8) / 描述(大模型生成) -> 点击"确定"
 """
@@ -60,6 +60,23 @@ def previous_month(today: datetime.date) -> tuple[int, int]:
     first_of_this_month = today.replace(day=1)
     last_day_prev_month = first_of_this_month - datetime.timedelta(days=1)
     return last_day_prev_month.year, last_day_prev_month.month
+
+
+def prompt_target_month(today: datetime.date) -> tuple[int, int]:
+    """读取 1~12 的月份数，并将它解析成最近一个不晚于当前月的年月。"""
+    while True:
+        raw = input("要填写的月份（1-12）: ").strip()
+        try:
+            month = int(raw)
+        except ValueError:
+            print("请输入 1 到 12 之间的月份数字，例如 7。")
+            continue
+        if not 1 <= month <= 12:
+            print("月份必须在 1 到 12 之间。")
+            continue
+        year = today.year if month <= today.month else today.year - 1
+        print(f"本次将填写 {year}-{month:02d} 的任务。")
+        return year, month
 
 
 def business_days_in_month(year: int, month: int, cap: datetime.date | None = None) -> list[datetime.date]:
@@ -169,9 +186,9 @@ def build_rate_sequence(n: int) -> list[int]:
     return [round(RATE_START + (end - RATE_START) * i / (n - 1)) for i in range(n)]
 
 
-def build_plan(tasks: list[dict], today: datetime.date) -> list[dict]:
-    target_year, target_month = previous_month(today)
-
+def build_plan(
+    tasks: list[dict], today: datetime.date, target_year: int, target_month: int
+) -> list[dict]:
     target_tasks = [
         t
         for t in tasks
@@ -203,10 +220,10 @@ def build_plan(tasks: list[dict], today: datetime.date) -> list[dict]:
     return plan
 
 
-def print_plan(plan: list[dict]):
-    print("\n===== 上个月任务排期计划 =====")
+def print_plan(plan: list[dict], target_year: int, target_month: int):
+    print(f"\n===== {target_year}-{target_month:02d} 任务排期计划 =====")
     if not plan:
-        print("（没有找到计划开始日期在上个月的任务）")
+        print(f"（没有找到计划开始日期在 {target_year}-{target_month:02d} 的任务）")
         return
     for p in plan:
         print(f"- {p['name']}  估计工作量: {p['plan_effort_hours']}小时  需要 {p['days_needed']} 天")
@@ -215,7 +232,7 @@ def print_plan(plan: list[dict]):
         if p["rates"]:
             print(f"    完成率: {p['rates'][0]}% -> {p['rates'][-1]}%")
         if p["pending_days"] > 0:
-            print(f"    ⚠ 上个月工作日不够分了，还有 {p['pending_days']} 天没排上，本次不会填写")
+            print(f"    ⚠ 指定月份的工作日不够分了，还有 {p['pending_days']} 天没排上，本次不会填写")
     print("=============================\n")
 
 
@@ -407,6 +424,7 @@ def main():
     password = getpass.getpass("密码: ")
 
     today = datetime.date.today()
+    target_year, target_month = prompt_target_month(today)
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=HEADLESS, args=["--ignore-certificate-errors"])
@@ -446,13 +464,13 @@ def main():
             print(f"- {t['name']} | 计划开始日期: {t['plan_start']} | 估计工作量: {t['plan_effort_hours']}小时")
         print("=====================================\n")
 
-        plan = build_plan(tasks, today)
+        plan = build_plan(tasks, today, target_year, target_month)
 
         with open(PLAN_FILE, "w", encoding="utf-8") as f:
             json.dump(plan, f, ensure_ascii=False, indent=2)
         print(f"计划已保存到 {PLAN_FILE}")
 
-        print_plan(plan)
+        print_plan(plan, target_year, target_month)
 
         total_entries = sum(len(p["assigned_dates"]) for p in plan)
         if total_entries == 0:
