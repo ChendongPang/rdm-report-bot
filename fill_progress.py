@@ -25,6 +25,7 @@ import re
 import time
 
 from playwright.sync_api import sync_playwright
+from chinese_calendar import is_workday
 
 from llm_helper import generate_daily_descriptions
 
@@ -79,16 +80,52 @@ def prompt_target_month(today: datetime.date) -> tuple[int, int]:
         return year, month
 
 
-def business_days_in_month(year: int, month: int, cap: datetime.date | None = None) -> list[datetime.date]:
+def prompt_leave_dates(year: int, month: int) -> set[datetime.date]:
+    """读取目标月份内的请假日期；直接回车表示没有请假。"""
+    while True:
+        raw = input(
+            "请假日期（可输入多天，用逗号或空格分隔；支持日期数字或 YYYY-MM-DD，直接回车跳过）: "
+        ).strip()
+        if not raw:
+            print("本次没有请假日期。")
+            return set()
+
+        values = [value for value in re.split(r"[，,\s]+", raw) if value]
+        dates: set[datetime.date] = set()
+        try:
+            for value in values:
+                if re.fullmatch(r"\d{1,2}", value):
+                    leave_date = datetime.date(year, month, int(value))
+                else:
+                    leave_date = datetime.date.fromisoformat(value)
+                if (leave_date.year, leave_date.month) != (year, month):
+                    raise ValueError(f"{value} 不在 {year}-{month:02d} 内")
+                dates.add(leave_date)
+        except ValueError as exc:
+            print(f"请假日期格式有误：{exc}。请重新输入，或直接回车跳过。")
+            continue
+
+        print("本次请假日期：" + ", ".join(d.isoformat() for d in sorted(dates)))
+        return dates
+
+
+def business_days_in_month(
+    year: int,
+    month: int,
+    cap: datetime.date | None = None,
+    leave_dates: set[datetime.date] | None = None,
+) -> list[datetime.date]:
     last_day = calendar.monthrange(year, month)[1]
     month_end = datetime.date(year, month, last_day)
     if cap is not None:
         month_end = min(month_end, cap)
 
+    leave_dates = leave_dates or set()
     days = []
     d = datetime.date(year, month, 1)
     while d <= month_end:
-        if d.weekday() < 5:  # 周一~周五
+        # is_workday 同时处理法定节假日和周末调休上班；个人请假最后统一排除。
+        if is_workday(d) and d not in leave_dates:
             days.append(d)
         d += datetime.timedelta(days=1)
     return days
@@ -187,7 +224,11 @@ def build_rate_sequence(n: int) -> list[int]:
 
 
 def build_plan(
-    tasks: list[dict], today: datetime.date, target_year: int, target_month: int
+    tasks: list[dict],
+    today: datetime.date,
+    target_year: int,
+    target_month: int,
+    leave_dates: set[datetime.date] | None = None,
 ) -> list[dict]:
     target_tasks = [
         t
@@ -197,7 +238,9 @@ def build_plan(
         and datetime.date.fromisoformat(t["plan_start"]).month == target_month
     ]
 
-    business_days = business_days_in_month(target_year, target_month, cap=today)
+    business_days = business_days_in_month(
+        target_year, target_month, cap=today, leave_dates=leave_dates
+    )
 
     plan = []
     cursor = 0
@@ -425,6 +468,7 @@ def main():
 
     today = datetime.date.today()
     target_year, target_month = prompt_target_month(today)
+    leave_dates = prompt_leave_dates(target_year, target_month)
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=HEADLESS, args=["--ignore-certificate-errors"])
@@ -464,7 +508,7 @@ def main():
             print(f"- {t['name']} | 计划开始日期: {t['plan_start']} | 估计工作量: {t['plan_effort_hours']}小时")
         print("=====================================\n")
 
-        plan = build_plan(tasks, today, target_year, target_month)
+        plan = build_plan(tasks, today, target_year, target_month, leave_dates=leave_dates)
 
         with open(PLAN_FILE, "w", encoding="utf-8") as f:
             json.dump(plan, f, ensure_ascii=False, indent=2)
