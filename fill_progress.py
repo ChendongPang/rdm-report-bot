@@ -369,38 +369,57 @@ def select_calendar_date(entity_frame, date_str: str):
     target = datetime.date.fromisoformat(date_str)
     page = entity_frame.page
 
-    entity_frame.locator("#report_action_date").click()
-
-    cal = entity_frame.locator("#c_calendarDiv")
-    try:
-        cal.wait_for(state="visible", timeout=8000)
-    except Exception:
-        os.makedirs("screenshots", exist_ok=True)
-        page.screenshot(path="screenshots/debug_calendar_year_timeout.png", full_page=True)
-        raise
-
-    year_el = entity_frame.locator("#c_year")
-    month_el = entity_frame.locator("#c_month")
-    year_el.filter(has_text=re.compile(r"\d")).first.wait_for(timeout=8000)
-
-    for _ in range(36):  # 最多翻 3 年，防止死循环
-        cur_year = int(year_el.inner_text().strip())
-        cur_month = int(month_el.inner_text().strip())
-        if (cur_year, cur_month) == (target.year, target.month):
-            break
-        # 日历头部(#c_ctrl_head)和底部(#c_ctrl_foot)各有一份翻月箭头，两边等效，取第一个即可
-        if (cur_year, cur_month) < (target.year, target.month):
-            entity_frame.locator('a[title="下一月"]').first.click()
-        else:
-            entity_frame.locator('a[title="上一月"]').first.click()
-        page.wait_for_timeout(150)
-    else:
-        raise RuntimeError(f"翻月份翻不到 {target.year}-{target.month}")
-
+    date_input = entity_frame.locator("#report_action_date")
     title_attr = f"{target.year}-{target.month}-{target.day}"
-    cell = entity_frame.locator(f'#c_body td[title="{title_attr}"]')
-    cell.first.click()
-    page.wait_for_timeout(400)
+
+    # 页面偶尔会吞掉第一次日历点击。每次点击后必须以输入框真实值为准，不能只以
+    # “click 没报错”作为选择成功，否则会把内容误写到控件默认的当天。
+    for attempt in range(1, 3):
+        date_input.click()
+
+        cal = entity_frame.locator("#c_calendarDiv:visible")
+        try:
+            cal.wait_for(state="visible", timeout=8000)
+        except Exception:
+            os.makedirs("screenshots", exist_ok=True)
+            page.screenshot(path="screenshots/debug_calendar_year_timeout.png", full_page=True)
+            raise
+
+        year_el = cal.locator("#c_year")
+        month_el = cal.locator("#c_month")
+        year_el.filter(has_text=re.compile(r"\d")).first.wait_for(timeout=8000)
+
+        for _ in range(36):  # 最多翻 3 年，防止死循环
+            cur_year = int(year_el.inner_text().strip())
+            cur_month = int(month_el.inner_text().strip())
+            if (cur_year, cur_month) == (target.year, target.month):
+                break
+            if (cur_year, cur_month) < (target.year, target.month):
+                cal.locator('a[title="下一月"]').first.click()
+            else:
+                cal.locator('a[title="上一月"]').first.click()
+            page.wait_for_timeout(150)
+        else:
+            raise RuntimeError(f"翻月份翻不到 {target.year}-{target.month}")
+
+        cell = cal.locator(f'#c_body td[title="{title_attr}"]')
+        if cell.count() != 1:
+            raise RuntimeError(f"日历中目标日期 {date_str} 匹配到 {cell.count()} 个格子")
+        cell.click()
+
+        for _ in range(20):
+            if date_input.input_value().strip() == date_str:
+                return
+            page.wait_for_timeout(100)
+        log(
+            f"日历第 {attempt} 次选择未生效：目标 {date_str}，"
+            f"字段实际为 {date_input.input_value().strip() or '(空)'}，准备重试"
+        )
+
+    os.makedirs("screenshots", exist_ok=True)
+    page.screenshot(path=f"screenshots/date_mismatch_{date_str}.png", full_page=True)
+    actual = date_input.input_value().strip()
+    raise RuntimeError(f"执行日期选择失败：目标 {date_str}，字段实际为 {actual or '(空)'}，已禁止提交")
 
 
 def fill_and_submit(entity_frame, tab_frame, date_str: str, description: str, rate: int):
@@ -422,9 +441,6 @@ def fill_and_submit(entity_frame, tab_frame, date_str: str, description: str, ra
             setVal('#report_rate', rate);
             setVal('#report_in_work', hours);
             setVal('#operate_remark', remark);
-            if (typeof dataChange === 'function') {
-                try { dataChange(); } catch (e) {}
-            }
         }""",
         [str(rate), REPORT_HOURS, description],
     )
@@ -440,6 +456,15 @@ def fill_and_submit(entity_frame, tab_frame, date_str: str, description: str, ra
         })"""
     )
     print(f"    提交前字段回读: {values}")
+
+    if values.get("date", "").strip() != date_str:
+        os.makedirs("screenshots", exist_ok=True)
+        entity_frame.page.screenshot(
+            path=f"screenshots/date_mismatch_before_submit_{date_str}.png", full_page=True
+        )
+        raise RuntimeError(
+            f"提交前日期校验失败：目标 {date_str}，字段实际为 {values.get('date') or '(空)'}，已禁止提交"
+        )
 
     page = tab_frame.page
     tab_frame.locator('input[onclick*="saveInstantce"]').click()
@@ -509,6 +534,15 @@ def main():
         print("=====================================\n")
 
         plan = build_plan(tasks, today, target_year, target_month, leave_dates=leave_dates)
+        assigned_dates = {
+            datetime.date.fromisoformat(date_str)
+            for item in plan
+            for date_str in item["assigned_dates"]
+        }
+        unexpected_leave_dates = sorted(assigned_dates & leave_dates)
+        if unexpected_leave_dates:
+            dates_text = ", ".join(d.isoformat() for d in unexpected_leave_dates)
+            raise RuntimeError(f"排期错误：请假日期仍出现在计划中：{dates_text}，已禁止继续")
 
         with open(PLAN_FILE, "w", encoding="utf-8") as f:
             json.dump(plan, f, ensure_ascii=False, indent=2)
