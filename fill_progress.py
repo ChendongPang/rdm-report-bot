@@ -372,10 +372,25 @@ def select_calendar_date(entity_frame, date_str: str):
     date_input = entity_frame.locator("#report_action_date")
     title_attr = f"{target.year}-{target.month}-{target.day}"
 
-    # 页面偶尔会吞掉第一次日历点击。每次点击后必须以输入框真实值为准，不能只以
-    # “click 没报错”作为选择成功，否则会把内容误写到控件默认的当天。
+    # 第一次保持原来的真人点击方式；只有回读发现选择未生效时，第二次才直接调用
+    # 页面原生入口重新绑定输入框和 dataChange 回调。每次都必须以输入框真实值
+    # 为准，不能只以“click 没报错”作为选择成功。
     for attempt in range(1, 3):
-        date_input.click()
+        if attempt == 1:
+            date_input.click()
+        else:
+            log("普通日历选择失败，改用 iCalendar.setDay 原生方式重试")
+            entity_frame.evaluate(
+                """() => {
+                    if (typeof iCalendar === 'undefined' || typeof iCalendar.setDay !== 'function') {
+                        throw new Error('页面中找不到 iCalendar.setDay');
+                    }
+                    if (typeof window.jQuery === 'undefined') {
+                        throw new Error('页面中找不到 jQuery');
+                    }
+                    iCalendar.setDay($("#report_action_date"), "dataChange");
+                }"""
+            )
 
         cal = entity_frame.locator("#c_calendarDiv:visible")
         try:
@@ -411,10 +426,11 @@ def select_calendar_date(entity_frame, date_str: str):
             if date_input.input_value().strip() == date_str:
                 return
             page.wait_for_timeout(100)
-        log(
-            f"日历第 {attempt} 次选择未生效：目标 {date_str}，"
-            f"字段实际为 {date_input.input_value().strip() or '(空)'}，准备重试"
-        )
+        actual = date_input.input_value().strip() or "(空)"
+        if attempt == 1:
+            log(f"普通日历选择未生效：目标 {date_str}，字段实际为 {actual}，准备使用原生方式重试")
+        else:
+            log(f"原生日历选择仍未生效：目标 {date_str}，字段实际为 {actual}")
 
     os.makedirs("screenshots", exist_ok=True)
     page.screenshot(path=f"screenshots/date_mismatch_{date_str}.png", full_page=True)
@@ -565,9 +581,10 @@ def main():
 
         run_total = min(total_entries, MAX_ENTRIES_TO_SUBMIT)
         submitted = 0
+        attempted = 0
         failed = []  # [(task_name, date_str, error), ...]
         for p in plan:
-            if submitted >= MAX_ENTRIES_TO_SUBMIT:
+            if attempted >= MAX_ENTRIES_TO_SUBMIT:
                 break
             if not p["assigned_dates"]:
                 continue
@@ -578,10 +595,11 @@ def main():
             log("描述生成完成")
 
             for date_str, desc, rate in zip(p["assigned_dates"], descriptions, p["rates"]):
-                if submitted >= MAX_ENTRIES_TO_SUBMIT:
+                if attempted >= MAX_ENTRIES_TO_SUBMIT:
                     break
 
-                idx = submitted + 1
+                attempted += 1
+                idx = attempted
                 print(f"\n>>> [{idx}/{run_total}] 填写任务《{p['name']}》 日期 {date_str}")
                 print(f"    完成率: {rate}%")
                 print(f"    描述: {desc}")
@@ -623,7 +641,7 @@ def main():
 
                 if ok:
                     submitted += 1
-                    log(f"进度: {submitted}/{run_total} 条已提交")
+                    log(f"进度: 已尝试 {attempted}/{run_total} 条，成功提交 {submitted} 条")
                 else:
                     failed.append((p["name"], date_str, str(last_err)))
                     log(f"跳过这一条（{p['name']} {date_str}），继续下一条")
