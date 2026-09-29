@@ -14,3 +14,6 @@ screenshots/*
 # Docker 镜像导出文件，体积太大不进版本库
 *.tar
 reset_hours_result.json
+
+work_log*.xlsx
+.idea/
