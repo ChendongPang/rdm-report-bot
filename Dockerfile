@@ -17,7 +17,7 @@ RUN pip install -r requirements.txt \
          libnspr4 libnss3 libasound2t64 fonts-noto-cjk \
     && rm -rf /var/lib/apt/lists/*
 
-COPY fill_progress.py llm_helper.py ./
+COPY fill_progress.py llm_helper.py work_log.xlsx ./
 
 RUN mkdir -p /app/screenshots
 

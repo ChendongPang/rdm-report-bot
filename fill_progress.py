@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
 自动为"计划开始日期是指定月份"的任务，按 估计工作量(小时)/8 算出的天数，
-从指定月份第一个工作日开始连续排期，逐日填写进展（完成率从 RATE_START 逐天
-递增到该任务最后一天落在 (RATE_END_MIN, RATE_END_MAX) 之间的随机值，当日
-投入工作量固定 8 小时，描述由大模型生成且互不相同），并提交保存。
+从指定月份第一个工作日开始连续排期，逐日填写进展（完成率按日期在当月工作日
+列表中的位置线性插值：第 1 个工作日 RATE_START%，最后 1 个工作日 RATE_END%；
+与任务无关，整月一条进度曲线。当日投入工作量固定 8 小时，描述由大模型生成
+且互不相同），并提交保存。
 
 流程:
   1. 登录
@@ -23,23 +24,25 @@ import os
 import random
 import re
 import time
+from dataclasses import dataclass
+from typing import Callable
 
 from playwright.sync_api import sync_playwright
 from chinese_calendar import is_workday
 
-from llm_helper import generate_daily_descriptions
+from llm_helper import archive_and_reset_work_log, configure_llm, generate_daily_descriptions
 
 URL = "https://imm.kmerit.com:64892/index.jsp"
 PLAN_FILE = "task_plan.json"
 
 REPORT_HOURS = "8"
 
-# 完成率不再是固定值：每个任务从 RATE_START 开始，随着天数往上涨，涨到
-# 这个任务最后一天时落在 (RATE_END_MIN, RATE_END_MAX) 之间的一个随机值
-# （每个任务的终值不一样，看起来更像真实进度，而不是每天都写死同一个数）。
-RATE_START = 5
-RATE_END_MIN = 92
-RATE_END_MAX = 96
+# 完成率随任务排期天数线性递增：第一个工作日 RATE_START%，最后一个工作日
+# RATE_END%（固定 100%——任务结束那天必须 100% 完成）。中间天线性插值；
+# 下一个任务又是从 RATE_START 开始递增。每段任务都必须以 100% 收尾。
+RATE_START = 0
+RATE_END_MIN = 100
+RATE_END_MAX = 100
 
 # 安全阀：先设小一点跑通流程，确认没问题后再调大。MAX_ENTRIES=0 表示不限制，把计划里的都填完。
 _max_entries_raw = int(os.getenv("MAX_ENTRIES", "1"))
@@ -47,6 +50,29 @@ MAX_ENTRIES_TO_SUBMIT = _max_entries_raw if _max_entries_raw > 0 else float("inf
 
 # 默认无头运行（不弹浏览器窗口）；本机想弹出浏览器窗口调试时设 HEADLESS=0
 HEADLESS = os.getenv("HEADLESS", "1") != "0"
+
+
+@dataclass
+class RunParams:
+    """外部调用（Web 控制台 webui.py）传给 main() 的运行参数。
+
+    与命令行交互一一对应：max_entries/headless 为 None 时沿用环境变量，
+    llm_* 为 None 时沿用 llm_helper 当前配置（环境变量或上一次设置）。"""
+
+    username: str = ""
+    password: str = ""
+    month: int = 0  # 1-12
+    leave_dates_raw: str = ""  # 原样输入，如 "3, 8" 或 "2026-09-03"，空=无请假
+    max_entries: int | None = None  # >=1 限制条数；0 不限制
+    headless: bool | None = None
+    llm_url: str | None = None
+    llm_api_key: str | None = None
+    llm_model: str | None = None
+    pause_on_finish: bool = False  # 非 headless 跑完后是否等回车再关浏览器
+
+
+# 排期确认回调：收到 (plan, 总条数, 本次上限描述)，返回 True 才开始逐条提交
+ConfirmFn = Callable[[list[dict], int, str], bool]
 
 
 def log(msg: str):
@@ -63,6 +89,14 @@ def previous_month(today: datetime.date) -> tuple[int, int]:
     return last_day_prev_month.year, last_day_prev_month.month
 
 
+def resolve_target_month(today: datetime.date, month: int) -> tuple[int, int]:
+    """把 1~12 的月份数解析成最近一个不晚于当前月的年月（不合法抛 ValueError）。"""
+    if not 1 <= month <= 12:
+        raise ValueError("月份必须在 1 到 12 之间")
+    year = today.year if month <= today.month else today.year - 1
+    return year, month
+
+
 def prompt_target_month(today: datetime.date) -> tuple[int, int]:
     """读取 1~12 的月份数，并将它解析成最近一个不晚于当前月的年月。"""
     while True:
@@ -72,12 +106,28 @@ def prompt_target_month(today: datetime.date) -> tuple[int, int]:
         except ValueError:
             print("请输入 1 到 12 之间的月份数字，例如 7。")
             continue
-        if not 1 <= month <= 12:
-            print("月份必须在 1 到 12 之间。")
+        try:
+            year, month = resolve_target_month(today, month)
+        except ValueError as exc:
+            print(f"{exc}。请重新输入。")
             continue
-        year = today.year if month <= today.month else today.year - 1
         print(f"本次将填写 {year}-{month:02d} 的任务。")
         return year, month
+
+
+def parse_leave_dates(year: int, month: int, raw: str) -> set[datetime.date]:
+    """把请假日期原始输入解析成日期集合；空输入返回空集，格式错抛 ValueError。"""
+    values = [value for value in re.split(r"[，,\s]+", raw) if value]
+    dates: set[datetime.date] = set()
+    for value in values:
+        if re.fullmatch(r"\d{1,2}", value):
+            leave_date = datetime.date(year, month, int(value))
+        else:
+            leave_date = datetime.date.fromisoformat(value)
+        if (leave_date.year, leave_date.month) != (year, month):
+            raise ValueError(f"{value} 不在 {year}-{month:02d} 内")
+        dates.add(leave_date)
+    return dates
 
 
 def prompt_leave_dates(year: int, month: int) -> set[datetime.date]:
@@ -90,17 +140,8 @@ def prompt_leave_dates(year: int, month: int) -> set[datetime.date]:
             print("本次没有请假日期。")
             return set()
 
-        values = [value for value in re.split(r"[，,\s]+", raw) if value]
-        dates: set[datetime.date] = set()
         try:
-            for value in values:
-                if re.fullmatch(r"\d{1,2}", value):
-                    leave_date = datetime.date(year, month, int(value))
-                else:
-                    leave_date = datetime.date.fromisoformat(value)
-                if (leave_date.year, leave_date.month) != (year, month):
-                    raise ValueError(f"{value} 不在 {year}-{month:02d} 内")
-                dates.add(leave_date)
+            dates = parse_leave_dates(year, month, raw)
         except ValueError as exc:
             print(f"请假日期格式有误：{exc}。请重新输入，或直接回车跳过。")
             continue
@@ -212,15 +253,39 @@ def parse_tasks(task_frame) -> list[dict]:
 
 
 def build_rate_sequence(n: int) -> list[int]:
-    """给一个任务的 n 天生成递增的完成率序列：从 RATE_START 开始，随天数逐步
-    涨到最后一天落在 (RATE_END_MIN, RATE_END_MAX) 之间的一个随机值（每个任务
-    的终值不同，更像真实进度而不是每天都写死同一个数）。"""
+    """旧接口（按任务段 0%→100%），保留以防外部调用。"""
     if n <= 0:
         return []
     end = random.randint(RATE_END_MIN, RATE_END_MAX)
     if n == 1:
         return [end]
     return [round(RATE_START + (end - RATE_START) * i / (n - 1)) for i in range(n)]
+
+
+def build_rates_for_dates(
+    assigned: list[datetime.date],
+    business_days: list[datetime.date],
+) -> list[int]:
+    """根据每个日期在【整月工作日池】（calendar_pool）里的位置算完成率：第 1 个
+    工作日 RATE_START%，最后 1 个工作日（即使是未来填不到的那天）RATE_END%，
+    中间按位置线性插值。这样今天填的记录不会"虚高"——100% 永远留给月底最后
+    一个工作日，不管今天离月底还有几天，都有相应进度空间。整个 calendar_pool
+    只有 1 个工作日时，所有日期都给 RATE_END% 兜底。"""
+    if not assigned or not business_days:
+        return []
+    total = len(business_days)
+    if total == 1:
+        return [RATE_END_MIN] * len(assigned)
+    pos_of = {d: i for i, d in enumerate(business_days)}
+    rates = []
+    for d in assigned:
+        pos = pos_of.get(d)
+        if pos is None:
+            rates.append(RATE_END_MIN)  # 日期不在工作日列表里（异常情况）兜底
+            continue
+        rate = RATE_START + (RATE_END_MIN - RATE_START) * pos / (total - 1)
+        rates.append(round(rate))
+    return rates
 
 
 def build_plan(
@@ -238,7 +303,10 @@ def build_plan(
         and datetime.date.fromisoformat(t["plan_start"]).month == target_month
     ]
 
-    business_days = business_days_in_month(
+    calendar_pool = business_days_in_month(
+        target_year, target_month, cap=None, leave_dates=leave_dates
+    )
+    fillable = business_days_in_month(
         target_year, target_month, cap=today, leave_dates=leave_dates
     )
 
@@ -246,7 +314,7 @@ def build_plan(
     cursor = 0
     for t in target_tasks:
         days_needed = math.ceil(t["plan_effort_hours"] / 8) if t["plan_effort_hours"] > 0 else 0
-        assigned = business_days[cursor : cursor + days_needed]
+        assigned = fillable[cursor : cursor + days_needed]
         cursor += len(assigned)
 
         plan.append(
@@ -257,7 +325,7 @@ def build_plan(
                 "days_needed": days_needed,
                 "assigned_dates": [d.isoformat() for d in assigned],
                 "pending_days": days_needed - len(assigned),
-                "rates": build_rate_sequence(len(assigned)),
+                "rates": build_rates_for_dates(assigned, calendar_pool),
             }
         )
     return plan
@@ -438,7 +506,9 @@ def select_calendar_date(entity_frame, date_str: str):
     raise RuntimeError(f"执行日期选择失败：目标 {date_str}，字段实际为 {actual or '(空)'}，已禁止提交")
 
 
-def fill_and_submit(entity_frame, tab_frame, date_str: str, description: str, rate: int):
+def fill_and_submit(
+    entity_frame, tab_frame, date_str: str, description: str, rate: int, shot=None
+):
     # 先真实点日历选中目标日期（会触发控件自己的 dataChange，如果这天已有记录，
     # 通常这时完成率/描述就会被加载成旧值），再等一下给可能的异步加载留时间，
     # 然后把完成率/工时/描述覆盖成我们要的新值。
@@ -482,6 +552,9 @@ def fill_and_submit(entity_frame, tab_frame, date_str: str, description: str, ra
             f"提交前日期校验失败：目标 {date_str}，字段实际为 {values.get('date') or '(空)'}，已禁止提交"
         )
 
+    if shot:
+        shot()  # 提交前的表单状态（日期已选、字段已填）推给 Web 控制台
+
     page = tab_frame.page
     tab_frame.locator('input[onclick*="saveInstantce"]').click()
     dismiss_confirm_dialog_if_present(page)
@@ -503,19 +576,60 @@ def go_back_to_task_list(page):
     return task_frame
 
 
-def main():
-    username = input("用户名: ").strip()
-    password = getpass.getpass("密码: ")
+def main(
+    params: RunParams | None = None,
+    confirm_fn: ConfirmFn | None = None,
+    shot_hook: Callable[[bytes], None] | None = None,
+):
+    """params 为 None 时走原命令行交互（行为不变）；外部入口（Web 控制台）传
+    params + confirm_fn：所有交互输入改由参数提供，"确认开始"通过 confirm_fn
+    回调（返回 True 才继续），排期/安全阀/重试等逻辑与命令行完全一致。
 
-    today = datetime.date.today()
-    target_year, target_month = prompt_target_month(today)
-    leave_dates = prompt_leave_dates(target_year, target_month)
+    shot_hook 可选：每执行到关键一步（登录页/任务列表/打开详情/提交前后/出错）
+    回调一次 JPEG 截图字节，供 Web 控制台右栏"实时画面"显示当前页面。"""
+    if params is None:
+        username = input("用户名: ").strip()
+        password = getpass.getpass("密码: ")
+
+        today = datetime.date.today()
+        target_year, target_month = prompt_target_month(today)
+        leave_dates = prompt_leave_dates(target_year, target_month)
+        max_entries = MAX_ENTRIES_TO_SUBMIT
+        headless = HEADLESS
+        pause_on_finish = True
+    else:
+        username = params.username.strip()
+        password = params.password
+        today = datetime.date.today()
+        target_year, target_month = resolve_target_month(today, params.month)
+        leave_dates = parse_leave_dates(target_year, target_month, params.leave_dates_raw)
+        raw_max = (
+            params.max_entries if params.max_entries is not None else int(os.getenv("MAX_ENTRIES", "1"))
+        )
+        max_entries = raw_max if raw_max > 0 else float("inf")
+        headless = (
+            params.headless
+            if params.headless is not None
+            else os.getenv("HEADLESS", "1") != "0"
+        )
+        pause_on_finish = params.pause_on_finish
+        if (
+            params.llm_url is not None
+            or params.llm_api_key is not None
+            or params.llm_model is not None
+        ):
+            configure_llm(params.llm_url, params.llm_api_key, params.llm_model)
+        print(f"本次将填写 {target_year}-{target_month:02d} 的任务。")
+        if leave_dates:
+            print("本次请假日期：" + ", ".join(d.isoformat() for d in sorted(leave_dates)))
+        else:
+            print("本次没有请假日期。")
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=HEADLESS, args=["--ignore-certificate-errors"])
+        browser = p.chromium.launch(headless=headless, args=["--ignore-certificate-errors"])
         context = browser.new_context(ignore_https_errors=True)
         page = context.new_page()
-        if not HEADLESS:
+        if not headless:
             # 尝试让浏览器窗口自动弹到前台；WSL/Windows 的焦点抢占保护可能仍会
             # 拦下来，不保证 100% 生效，但没有副作用
             try:
@@ -523,23 +637,34 @@ def main():
             except Exception:
                 pass
 
+        def snap():
+            """把当前画面推给 Web 控制台（shot_hook），让右栏能看到进行到哪一步。"""
+            if shot_hook is None:
+                return
+            try:
+                shot_hook(page.screenshot(type="jpeg", quality=70))
+            except Exception:
+                pass  # 画面推送失败不该影响填报主流程
+
         log("正在打开登录页...")
-        page.goto(URL, wait_until="networkidle", timeout=30000)
+        page.goto(URL, wait_until="domcontentloaded", timeout=60000)
+        snap()
         page.fill("#userName", username)
         page.fill("#userPassword", password)
         log("正在登录...")
-        with page.expect_navigation(wait_until="networkidle", timeout=30000):
+        with page.expect_navigation(wait_until="domcontentloaded", timeout=60000):
             page.click("#loginBtn")
         log("登录成功")
 
         task_frame = page.frame(name="main")
-        task_frame.wait_for_load_state("networkidle", timeout=15000)
+        task_frame.wait_for_load_state("domcontentloaded", timeout=30000)
         task_frame.wait_for_selector("#taskPanel .body-row", timeout=15000)
         task_frame.wait_for_selector('th.head-th[name="Name"]', timeout=15000)
 
         log("正在读取任务列表...")
         tasks = parse_tasks(task_frame)
         log(f"读取到 {len(tasks)} 条任务")
+        snap()
 
         with open("raw_tasks.json", "w", encoding="utf-8") as f:
             json.dump(tasks, f, ensure_ascii=False, indent=2)
@@ -572,30 +697,40 @@ def main():
             browser.close()
             return
 
-        limit_text = "不限制" if MAX_ENTRIES_TO_SUBMIT == float("inf") else f"{int(MAX_ENTRIES_TO_SUBMIT)} 条"
-        confirm = input(f"共 {total_entries} 条待填写记录，本次最多执行 {limit_text}（MAX_ENTRIES 环境变量可调，0=不限制）。确认开始？(y/n): ")
-        if confirm.strip().lower() != "y":
+        limit_text = "不限制" if max_entries == float("inf") else f"{int(max_entries)} 条"
+        if confirm_fn is not None:
+            ok_to_run = confirm_fn(plan, total_entries, limit_text)
+        else:
+            confirm = input(
+                f"共 {total_entries} 条待填写记录，本次最多执行 {limit_text}"
+                "（MAX_ENTRIES 环境变量可调，0=不限制）。确认开始？(y/n): "
+            )
+            ok_to_run = confirm.strip().lower() == "y"
+        if not ok_to_run:
             print("已取消。")
             browser.close()
             return
 
-        run_total = min(total_entries, MAX_ENTRIES_TO_SUBMIT)
+        run_total = min(total_entries, max_entries)
         submitted = 0
         attempted = 0
         failed = []  # [(task_name, date_str, error), ...]
         for p in plan:
-            if attempted >= MAX_ENTRIES_TO_SUBMIT:
+            if attempted >= max_entries:
                 break
             if not p["assigned_dates"]:
                 continue
 
             log(f"正在为《{p['name']}》生成 {len(p['assigned_dates'])} 条工作描述（调用大模型）...")
-            descriptions = generate_daily_descriptions(p["name"], len(p["assigned_dates"]))
+            # 把每个日期传进去，配合 work_log.md 让大模型按"当天实际在做什么"生成
+            descriptions = generate_daily_descriptions(
+                p["name"], len(p["assigned_dates"]), p["assigned_dates"]
+            )
             p["descriptions"] = descriptions
             log("描述生成完成")
 
             for date_str, desc, rate in zip(p["assigned_dates"], descriptions, p["rates"]):
-                if attempted >= MAX_ENTRIES_TO_SUBMIT:
+                if attempted >= max_entries:
                     break
 
                 attempted += 1
@@ -613,11 +748,13 @@ def main():
                     try:
                         log(f"打开任务详情页...{'' if attempt == 1 else '（重试）'}")
                         entity_frame, tab_frame = open_task(page, task_frame, p["task_id"])
+                        snap()
 
                         log(f"选择执行日期 {date_str}...")
                         log("填写完成率/工时/描述并提交...")
-                        fill_and_submit(entity_frame, tab_frame, date_str, desc, rate)
+                        fill_and_submit(entity_frame, tab_frame, date_str, desc, rate, shot=snap)
                         log("提交完成")
+                        snap()
 
                         page.wait_for_timeout(1500)
                         page.screenshot(
@@ -628,6 +765,7 @@ def main():
                     except Exception as e:
                         last_err = e
                         log(f"这条失败了: {e}")
+                        snap()
                         # 出错时页面状态不明（可能卡在详情页/弹窗），先想办法回到列表页
                         # 再重试，不然重试大概率也是错的
                         try:
@@ -646,6 +784,14 @@ def main():
                     failed.append((p["name"], date_str, str(last_err)))
                     log(f"跳过这一条（{p['name']} {date_str}），继续下一条")
 
+        # 所有任务的描述都生成完了，说明本次运行完整消费了工作日志：归档并
+        # 重置成空模板，下个月打开直接填新行。MAX_ENTRIES 只跑了部分（还有
+        # 任务没生成描述）时不清空，留着下次跑剩下的任务时继续用。
+        if all(p.get("descriptions") for p in plan if p["assigned_dates"]):
+            archived_to = archive_and_reset_work_log()
+            if archived_to:
+                log(f"工作日志已归档到 {archived_to}，日志文件已重置为空模板")
+
         with open(PLAN_FILE, "w", encoding="utf-8") as f:
             json.dump(plan, f, ensure_ascii=False, indent=2)
 
@@ -654,7 +800,7 @@ def main():
             print(f"有 {len(failed)} 条重试后仍失败，需要手动检查/重跑：")
             for name, date_str, err in failed:
                 print(f"  - 《{name}》 {date_str}：{err}")
-        if not HEADLESS:
+        if not headless and pause_on_finish:
             input("按回车键关闭浏览器...")
         browser.close()
 
